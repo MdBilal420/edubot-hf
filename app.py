@@ -39,9 +39,9 @@ class QuizQuestion(BaseModel):
     correct_answer: str  # This will now hold 'a', 'b', 'c', or 'd'
 
 class Resource(BaseModel):
-    resource_type: str  # 'pdf' or 'youtube'
-    url: str
-    content: Optional[str] = None
+    # resource_type: Optional[str]  # 'pdf' or 'youtube'
+    # url: Optional[str]
+    content: str
 
 class TranscriptRequest(BaseModel):
     video_id: str
@@ -57,24 +57,33 @@ class GenerateResponse(BaseModel):
     explanation: str
     questions: List[QuizQuestion]
 
-@app.post("/fetch-transcript", response_model=TranscriptResponse)
-async def fetch_transcript(request: TranscriptRequest):
-    """
-    Endpoint to fetch the transcript of a YouTube video given its video ID.
-    """
-    try:
-        # Fetch the transcript using YouTubeTranscriptApi
-        transcript = YouTubeTranscriptApi.get_transcript(request.video_id)
+@app.get("/fetch-transcript-video/{video_id}/{input}", response_model=TranscriptResponse)
+async def fetch_transcript(video_id: str, input: str):
+    try:       
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
         full_text = " ".join([entry['text'] for entry in transcript])
-        return {"transcript": full_text}
+
+        if input == "":       
+            # modify full_text to a markdown format using groq  
+            prompt = f"Modify the following text to a markdown format: {full_text}"
+        else:
+            prompt = f"Generate insights from the following content: {full_text} and focus on the following topic: {input} and return the content in markdown format"
+        response = groq_client.chat.completions.create(
+            model="mixtral-8x7b-32768",
+            messages=[{"role": "user", "content": prompt}], 
+            temperature=0.7,
+            max_tokens=1000
+        )
+        content = response.choices[0].message.content
+        return TranscriptResponse(transcript=content)
     except Exception as e:
-        # Handle errors and return an appropriate HTTP exception
+        print(f"Error: {str(e)}")  # Debug print
         raise HTTPException(status_code=400, detail=str(e))
 
 # In-memory session storage
 session_store = {}
 
-@app.post("/chat")
+@app.post("/n0-chat")
 async def chat_endpoint(chat_message: ChatMessage):
     # Get session context from in-memory store
     context = session_store.get(chat_message.session_id, {"history": []})
@@ -139,32 +148,61 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/generate-quiz")
+@app.post("/generate_quiz")
 async def generate_quiz(resource: Resource):
     # Use Groq to generate quiz questions based on content
     prompt = f"""
     Generate 5 multiple choice questions based on the following content:
-    {resource.content[:2000]}  # Limiting content length
+    {resource.content}
     
-    Format each question with 4 options and mark the correct answer.
+    Format your response as a JSON object with this exact structure:
+    {{
+        "questions": [
+            {{
+                "question": "Question text here",
+                "options": ["(Correct) Option A", "Option B", "Option C", "Option D"]
+            }}
+        ]
+    }}
     """
     
-    response   =    groq_client.chat.completions.create(
+    quiz_response = groq_client.chat.completions.create(
         model="mixtral-8x7b-32768",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+        temperature=0.1,
+        max_tokens=1000
     )
-    print("RESPONSE",response)
-    # Parse and structure the quiz questions
-    # (You'd need to implement proper parsing of the LLM response)
-    questions = []  # Parse response into QuizQuestion objects
     
-    return {"questions": questions}
+    # Parse and structure the quiz questions
+    try:
+        # First, get the response content and parse it as JSON
+        quiz_content = json.loads(quiz_response.choices[0].message.content)
+        questions = []
+        
+        for q in quiz_content["questions"]:
+            # Find the correct answer by looking for "(Correct)" marker
+            options = [opt.replace("(Correct) ", "").replace("(Incorrect) ", "") for opt in q["options"]]
+            correct_index = next(i for i, opt in enumerate(q["options"]) if "(Correct)" in opt)
+            correct_answer = chr(97 + correct_index)  # Convert index to 'a', 'b', 'c', or 'd'
+            
+            questions.append(QuizQuestion(
+                question=q["question"],
+                options=options,
+                correct_answer=correct_answer
+            ))
+        
+        return {"questions": questions}
+    except json.JSONDecodeError as e:
+        print("Failed to parse JSON:", quiz_response.choices[0].message.content)
+        raise HTTPException(status_code=500, detail="Failed to generate valid quiz questions")
+    except Exception as e:
+        print("Error processing quiz:", str(e))
+        raise HTTPException(status_code=500, detail="Error processing quiz questions")
 
 def find_correct_option(options):
     return next((option[0] for option in options if "(Correct)" in option[1]), None)
 
-@app.post("/generate_quiz", response_model=GenerateResponse)
+@app.post("/chat", response_model=GenerateResponse)
 async def generate_content(request: TopicRequest):
 
     # Determine the subject from the provided text
@@ -179,7 +217,6 @@ async def generate_content(request: TopicRequest):
         max_tokens=1000
     )
     subject = subject_response.choices[0].message.content.strip()
-    print("SUBJECT",subject)
 
     # Check if the subject was determined
     if subject.lower() == "invalid":
