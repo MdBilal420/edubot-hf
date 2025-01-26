@@ -59,18 +59,44 @@ class GenerateResponse(BaseModel):
 
 @app.get("/fetch-transcript-video/{video_id}/{input}", response_model=TranscriptResponse)
 async def fetch_transcript(video_id: str, input: str):
-    try:       
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        full_text = " ".join([entry['text'] for entry in transcript])
-
-        if not transcript:
-            raise HTTPException(status_code=400, detail="No transcript found for the given video ID")
+    try:
+        # First try YouTubeTranscriptApi
+        try:
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            full_text = " ".join([entry['text'] for entry in transcript])
+        except Exception as transcript_error:
+            # Fallback to yt-dlp if YouTubeTranscriptApi fails
+            ydl_opts = {
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitlesformat': 'txt',
+                'skip_download': True,
+                'quiet': True
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                if 'subtitles' in info or 'automatic_captions' in info:
+                    # Use automatic captions if regular subtitles aren't available
+                    captions = info.get('subtitles', {}) or info.get('automatic_captions', {})
+                    if 'en' in captions:  # Check for English captions
+                        full_text = " ".join([caption.get('text', '') for caption in captions['en']])
+                    else:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail="No English captions available for this video"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No captions available for this video"
+                    )
 
         if input == "":       
-            # modify full_text to a markdown format using groq  
             prompt = f"Modify the following text to a markdown format: {full_text}"
         else:
             prompt = f"Generate insights from the following content: {full_text} and focus on the following topic: {input} and return the content in markdown format"
+            
         response = groq_client.chat.completions.create(
             model="mixtral-8x7b-32768",
             messages=[{"role": "user", "content": prompt}], 
@@ -79,6 +105,7 @@ async def fetch_transcript(video_id: str, input: str):
         )
         content = response.choices[0].message.content
         return TranscriptResponse(transcript=content)
+        
     except Exception as e:
         print(f"Error: {str(e)}")  # Debug print
         raise HTTPException(status_code=400, detail=str(e))
