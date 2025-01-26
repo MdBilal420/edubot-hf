@@ -63,6 +63,9 @@ async def fetch_transcript(video_id: str, input: str):
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
         full_text = " ".join([entry['text'] for entry in transcript])
 
+        if not transcript:
+            raise HTTPException(status_code=400, detail="No transcript found for the given video ID")
+
         if input == "":       
             # modify full_text to a markdown format using groq  
             prompt = f"Modify the following text to a markdown format: {full_text}"
