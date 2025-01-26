@@ -10,6 +10,8 @@ import fitz  # PyMuPDF for PDF processing
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 app = FastAPI()
 
@@ -25,6 +27,9 @@ app.add_middleware(
 load_dotenv()
 # Initialize Groq client
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Add this with your other environment variables
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 print("")
 
@@ -65,32 +70,50 @@ async def fetch_transcript(video_id: str, input: str):
             transcript = YouTubeTranscriptApi.get_transcript(video_id)
             full_text = " ".join([entry['text'] for entry in transcript])
         except Exception as transcript_error:
-            # Fallback to yt-dlp if YouTubeTranscriptApi fails
-            ydl_opts = {
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitlesformat': 'txt',
-                'skip_download': True,
-                'quiet': True
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                if 'subtitles' in info or 'automatic_captions' in info:
-                    # Use automatic captions if regular subtitles aren't available
-                    captions = info.get('subtitles', {}) or info.get('automatic_captions', {})
-                    if 'en' in captions:  # Check for English captions
-                        full_text = " ".join([caption.get('text', '') for caption in captions['en']])
-                    else:
-                        raise HTTPException(
-                            status_code=400, 
-                            detail="No English captions available for this video"
-                        )
-                else:
+            # Fallback to YouTube Data API
+            try:
+                youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+                
+                # Get captions track
+                captions_response = youtube.captions().list(
+                    part='snippet',
+                    videoId=video_id
+                ).execute()
+                
+                if not captions_response.get('items'):
                     raise HTTPException(
                         status_code=400,
                         detail="No captions available for this video"
                     )
+                
+                # Get the first English caption track or default to the first available
+                caption_id = None
+                for item in captions_response['items']:
+                    if item['snippet']['language'] == 'en':
+                        caption_id = item['id']
+                        break
+                if not caption_id:
+                    caption_id = captions_response['items'][0]['id']
+                
+                # Download the caption track
+                caption = youtube.captions().download(
+                    id=caption_id,
+                    tfmt='srt'
+                ).execute()
+                
+                # Convert caption to text (remove timecodes and formatting)
+                full_text = ' '.join(
+                    line for line in caption.decode('utf-8').split('\n')
+                    if not line.strip().isdigit() and 
+                    not '-->' in line and 
+                    line.strip()
+                )
+                
+            except HttpError as api_error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"YouTube API error: {str(api_error)}"
+                )
 
         if input == "":       
             prompt = f"Modify the following text to a markdown format: {full_text}"
